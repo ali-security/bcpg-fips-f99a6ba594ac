@@ -12,8 +12,18 @@ import org.bouncycastle.bcpg.attr.ImageAttribute;
 public class UserAttributeSubpacketInputStream
     extends InputStream implements UserAttributeSubpacketTags
 {
+    /**
+     * Hard upper bound on a single user-attribute subpacket body. This is an absolute cap applied
+     * before the body buffer is allocated, as the stream used during packet parsing does not
+     * otherwise bound the per-packet allocation. Without it a crafted 4-octet length header could
+     * force a multi-gigabyte {@code new byte[]} before any body bytes are read. 2 MiB matches the
+     * ceiling used upstream for signature subpackets and public-key packets; user-attribute (image)
+     * subpackets are not expected to approach it.
+     */
+    public static final int MAX_SUBPACKET_LEN = 2 * 1024 * 1024;
+
     InputStream    in;
-    
+
     public UserAttributeSubpacketInputStream(
         InputStream    in)
     {
@@ -94,6 +104,18 @@ public class UserAttributeSubpacketInputStream
         else
         {
             throw new IOException("unrecognised length reading user attribute sub packet");
+        }
+
+        // Absolute cap, checked before allocating, so a crafted length cannot drive a huge allocation.
+        if (bodyLen > MAX_SUBPACKET_LEN)
+        {
+            throw new IOException("Body length octet (" + bodyLen + ") exceeds max user attribute subpacket length (" + MAX_SUBPACKET_LEN + ").");
+        }
+        // The body length covers the type octet, so it must be at least 1; a 5-octet length with the
+        // top bit set decodes negative and would otherwise wrap bodyLen - 1 to a huge allocation.
+        if (bodyLen < 1)
+        {
+            throw new IOException("Body length octet (" + bodyLen + ") out of range for user attribute sub packet.");
         }
 
        int        tag = in.read();

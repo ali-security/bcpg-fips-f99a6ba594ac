@@ -5,6 +5,8 @@ import java.io.ByteArrayOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
 
+import org.bouncycastle.bcpg.BCPGInputStream;
+import org.bouncycastle.bcpg.PacketTags;
 import org.bouncycastle.bcpg.UserAttributeSubpacket;
 import org.bouncycastle.bcpg.UserAttributeSubpacketInputStream;
 import org.bouncycastle.bcpg.UserAttributeSubpacketTags;
@@ -184,6 +186,102 @@ public class SealUserAttributeSubpacketInputStreamTest
         catch (EOFException e)
         {
             // expected
+        }
+    }
+
+    /**
+     * A sub-packet header using the five-octet length form, followed by the type octet only.
+     */
+    private static byte[] longLengthHeader(int bodyLen, int type)
+    {
+        return new byte[] {
+            (byte)0xff, (byte)(bodyLen >>> 24), (byte)(bodyLen >>> 16), (byte)(bodyLen >>> 8), (byte)bodyLen,
+            (byte)type };
+    }
+
+    private static void checkRejected(byte[] encoded, String expectedMessage)
+    {
+        try
+        {
+            new UserAttributeSubpacketInputStream(new ByteArrayInputStream(encoded)).readPacket();
+            fail("sub-packet with out of range length must not parse");
+        }
+        catch (EOFException e)
+        {
+            // an EOFException means the body buffer was allocated and the read ran off the end of the data
+            fail("length must be rejected before the body is allocated, got: " + e);
+        }
+        catch (IOException e)
+        {
+            assertTrue(e.getMessage(), e.getMessage().indexOf(expectedMessage) >= 0);
+        }
+    }
+
+    @Test
+    public void testHugeLengthRejectedBeforeAllocation()
+    {
+        // CVE-2026-59649: a ~2 GiB declared length with no body must not drive a multi-gigabyte allocation
+        checkRejected(longLengthHeader(0x7ffffff0, UserAttributeSubpacketTags.IMAGE_ATTRIBUTE),
+            "exceeds max user attribute subpacket length");
+        checkRejected(longLengthHeader(Integer.MAX_VALUE, 100), "exceeds max user attribute subpacket length");
+    }
+
+    @Test
+    public void testLengthJustOverMaxRejected()
+    {
+        checkRejected(longLengthHeader(UserAttributeSubpacketInputStream.MAX_SUBPACKET_LEN + 1, 100),
+            "exceeds max user attribute subpacket length (" + UserAttributeSubpacketInputStream.MAX_SUBPACKET_LEN + ")");
+    }
+
+    @Test
+    public void testNegativeLengthRejected()
+    {
+        // a five-octet length with the top bit set decodes negative; bodyLen - 1 must not wrap to a huge array
+        checkRejected(longLengthHeader(Integer.MIN_VALUE, 100), "out of range");
+        checkRejected(longLengthHeader(-1, 100), "out of range");
+        checkRejected(new byte[] { 0, 100 }, "out of range");
+    }
+
+    @Test
+    public void testMaxLengthAccepted()
+        throws IOException
+    {
+        int bodyLen = UserAttributeSubpacketInputStream.MAX_SUBPACKET_LEN;
+        byte[] body = image(bodyLen - 1);
+        ByteArrayOutputStream bOut = new ByteArrayOutputStream();
+        bOut.write(longLengthHeader(bodyLen, 100));
+        bOut.write(body);
+
+        UserAttributeSubpacket packet = new UserAttributeSubpacketInputStream(
+            new ByteArrayInputStream(bOut.toByteArray())).readPacket();
+        assertEquals(100, packet.getType());
+        assertArrayEquals(body, packet.getData());
+    }
+
+    @Test
+    public void testHugeLengthRejectedInUserAttributePacket()
+        throws IOException
+    {
+        // the same attack through the normal packet parsing path: a small User Attribute packet (tag 17)
+        // whose single sub-packet header declares a ~2 GiB body
+        byte[] subpacket = longLengthHeader(0x7ffffff0, UserAttributeSubpacketTags.IMAGE_ATTRIBUTE);
+        byte[] encoded = new byte[2 + subpacket.length];
+        encoded[0] = (byte)(0xc0 | PacketTags.USER_ATTRIBUTE);
+        encoded[1] = (byte)subpacket.length;
+        System.arraycopy(subpacket, 0, encoded, 2, subpacket.length);
+
+        try
+        {
+            new BCPGInputStream(new ByteArrayInputStream(encoded)).readPacket();
+            fail("user attribute packet with oversized sub-packet must not parse");
+        }
+        catch (EOFException e)
+        {
+            fail("length must be rejected before the body is allocated, got: " + e);
+        }
+        catch (IOException e)
+        {
+            assertTrue(e.getMessage(), e.getMessage().indexOf("exceeds max user attribute subpacket length") >= 0);
         }
     }
 }
