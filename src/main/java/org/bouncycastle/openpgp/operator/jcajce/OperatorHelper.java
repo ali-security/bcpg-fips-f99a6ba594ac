@@ -405,6 +405,7 @@ class OperatorHelper
         private int dataOff;
         private long chunkIndex = 0;
         private long totalBytes = 0;
+        private boolean aeadComplete = false; // set once the trailing message tag has been verified
 
         public PGPAeadInputStream(InputStream in, Cipher c, SecretKey secretKey, byte[] iv, int encAlgorithm, int aeadAlgorithm, int chunkSize)
             throws IOException
@@ -508,6 +509,17 @@ class OperatorHelper
             int dataLen = Streams.readFully(in, buf, 32, chunkLength);
             if (dataLen == 0)
             {
+                if (!aeadComplete)
+                {
+                    // A chunk-aligned message (plaintext an exact multiple of chunkLength) ends after a
+                    // full-size final data chunk, so the trailing message tag was pre-read into the
+                    // look-ahead (buf[0..16)) but the full-size-chunk path below never verified it.
+                    // Verify it now, before signalling EOF, so that truncation at a chunk boundary
+                    // (dropping trailing chunks plus the final tag) is rejected rather than accepted as
+                    // authentic - the final tag is what authenticates the total plaintext length.
+                    verifyFinalTag();
+                    aeadComplete = true;
+                }
                 return null;
             }
 
@@ -537,24 +549,8 @@ class OperatorHelper
 
             if (dataLen != chunkLength)     // it's our last block
             {
-                adata = new byte[13];
-
-                System.arraycopy(aaData, 0, adata, 0, aaData.length);
-
-                xorChunkId(adata, chunkIndex);
-                try
-                {
-                    c.init(Cipher.DECRYPT_MODE, secretKey, new GCMParameterSpec(128, getNonce(iv, chunkIndex)));
-
-                    c.updateAAD(adata);
-                    c.updateAAD(Pack.longToBigEndian(totalBytes));
-
-                    c.doFinal(buf, 0, 16); // check final tag
-                }
-                catch (GeneralSecurityException e)
-                {
-                    throw new IOException("exception processing final tag: " + e.getMessage());
-                }
+                verifyFinalTag();
+                aeadComplete = true;
             }
             else
             {
@@ -562,6 +558,31 @@ class OperatorHelper
             }
 
             return decData;
+        }
+
+        // Verify the trailing message tag, which is held in buf[0..16). Called both for a short
+        // final data chunk and for a chunk-aligned message whose final tag would otherwise be skipped.
+        private void verifyFinalTag()
+            throws IOException
+        {
+            byte[] adata = new byte[13];
+
+            System.arraycopy(aaData, 0, adata, 0, aaData.length);
+
+            xorChunkId(adata, chunkIndex);
+            try
+            {
+                c.init(Cipher.DECRYPT_MODE, secretKey, new GCMParameterSpec(128, getNonce(iv, chunkIndex)));
+
+                c.updateAAD(adata);
+                c.updateAAD(Pack.longToBigEndian(totalBytes));
+
+                c.doFinal(buf, 0, 16); // check final tag
+            }
+            catch (GeneralSecurityException e)
+            {
+                throw new IOException("exception processing final tag: " + e.getMessage());
+            }
         }
     }
 
