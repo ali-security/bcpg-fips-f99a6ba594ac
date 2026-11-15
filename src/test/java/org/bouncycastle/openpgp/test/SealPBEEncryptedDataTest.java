@@ -1,5 +1,6 @@
 package org.bouncycastle.openpgp.test;
 
+import java.io.IOException;
 import java.io.InputStream;
 
 import org.bouncycastle.bcpg.HashAlgorithmTags;
@@ -18,6 +19,7 @@ import org.bouncycastle.openpgp.operator.SessionKeyDataDecryptorFactory;
 import org.bouncycastle.openpgp.operator.jcajce.JcePBEDataDecryptorFactoryBuilder;
 import org.bouncycastle.openpgp.operator.jcajce.JcePBEKeyEncryptionMethodGenerator;
 import org.bouncycastle.util.Arrays;
+import org.bouncycastle.util.io.Streams;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
@@ -177,8 +179,186 @@ public class SealPBEEncryptedDataTest
         PGPSessionKeyEncryptedData skData = list2.extractSessionKeyEncryptedData();
         assertTrue(skData.isIntegrityProtected());
 
+        SessionKeyDataDecryptorFactory skFactory = sessionKeyDecryptor(sessionKey);
+
+        assertArrayEquals(message, SealTestUtil.readLiteral(skData.getDataStream(skFactory)));
+        assertTrue(skData.verify());
+    }
+
+    /**
+     * CVE-2026-59640: decrypting a SEIPD v1 packet from an already-recovered session key must not report
+     * the legacy CFB "quick check" on the two repeated prefix bytes - an early, distinguishable
+     * PGPDataValidationException("data check failed.") is the Mister-Zuccherato oracle. Integrity is
+     * left to the MDC.
+     */
+    @Test
+    public void testSessionKeyDecryptionSuppressesQuickCheckOracle()
+        throws Exception
+    {
+        byte[] encrypted = encryptWithPassword(SealTestUtil.randomMessage(100), SymmetricKeyAlgorithmTags.AES_256, true);
+        PGPSessionKey sessionKey = ((PGPPBEEncryptedData)SealTestUtil.readEncryptedDataList(encrypted).get(0))
+            .getSessionKey(pbeDecryptor(PASS));
+
+        // a WRONG session key decrypts the prefix to garbage, so the quick check bytes mismatch
+        PGPSessionKeyEncryptedData skData = SealTestUtil.readEncryptedDataList(encrypted).extractSessionKeyEncryptedData();
+        try
+        {
+            InputStream decrypted = skData.getDataStream(sessionKeyDecryptor(wrongSessionKey(sessionKey, 0)));
+            // reading the (garbage) stream may fail later (MDC / parse) - that is not an early quick-check signal
+            try
+            {
+                Streams.readAll(decrypted);
+                assertFalse("wrong session key must not pass the MDC", skData.verify());
+            }
+            catch (IOException e)
+            {
+                // acceptable: a wrong key surfaces as a later failure, not an early quick-check throw
+            }
+        }
+        catch (PGPDataValidationException e)
+        {
+            fail("session-key decryption must not expose the CFB quick-check oracle (early data check)");
+        }
+    }
+
+    /**
+     * CVE-2026-59640 exploit: an attacker able to submit modified ciphertexts to a party decrypting with
+     * the (correct) session key flips bits of the encrypted CFB check bytes and watches for the early
+     * "data check failed." - the Mister-Zuccherato oracle. The session-key path must give no such early
+     * signal; the tampering is caught by the MDC instead.
+     */
+    @Test
+    public void testSessionKeyDecryptionOfTamperedCheckBytesGivesNoOracle()
+        throws Exception
+    {
+        byte[] message = SealTestUtil.randomMessage(100);
+        byte[] encrypted = encryptWithPassword(message, SymmetricKeyAlgorithmTags.AES_256, true);
+        PGPSessionKey sessionKey = ((PGPPBEEncryptedData)SealTestUtil.readEncryptedDataList(encrypted).get(0))
+            .getSessionKey(pbeDecryptor(PASS));
+
+        int checkBytesOffset = quickCheckBytesOffset(encrypted, sessionKey);
+
+        // two different masks on the second check byte: at most one of them can turn the check bytes into
+        // the all-zero form the quick check also accepts, so at least one is a guaranteed check failure.
+        boolean reportedWhenRequested = false;
+        for (int mask = 1; mask <= 2; mask++)
+        {
+            byte[] tampered = Arrays.clone(encrypted);
+            tampered[checkBytesOffset + 1] ^= (byte)mask;
+
+            PGPSessionKeyEncryptedData skData = SealTestUtil.readEncryptedDataList(tampered).extractSessionKeyEncryptedData();
+            InputStream decrypted;
+            try
+            {
+                decrypted = skData.getDataStream(sessionKeyDecryptor(sessionKey));
+            }
+            catch (PGPDataValidationException e)
+            {
+                fail("session-key decryption must not expose the CFB quick-check oracle on tampered check bytes");
+                return;
+            }
+
+            Streams.readAll(decrypted);
+            assertFalse("tampered message must fail the MDC", skData.verify());
+
+            // the same tampering IS reported when the quick check is explicitly requested for a password
+            // derived session key - the early, distinguishable signal the default path must not give.
+            try
+            {
+                SealTestUtil.readEncryptedDataList(tampered).extractSessionKeyEncryptedData(true)
+                    .getDataStream(sessionKeyDecryptor(sessionKey));
+            }
+            catch (PGPDataValidationException e)
+            {
+                assertEquals("data check failed.", e.getMessage());
+                reportedWhenRequested = true;
+            }
+        }
+        assertTrue("tampered check bytes must be detected when the quick check is requested", reportedWhenRequested);
+    }
+
+    /**
+     * A SKESK packet which derives the session key from the S2K output directly (no encrypted session key, the
+     * shape a single password method produces) hands back a well formed session key for any passphrase, so on
+     * the SEIPD v1 packet that follows it only the CFB quick check tells a wrong passphrase from a right one.
+     * Decrypting in two steps has to be able to get that back, without turning it on for a session key that
+     * came from a public key operation.
+     */
+    @Test
+    public void testPasswordDerivedSessionKeyIsQuickChecked()
+        throws Exception
+    {
+        byte[] message = SealTestUtil.randomMessage(100);
+        byte[] encrypted = encryptWithPassword(message, SymmetricKeyAlgorithmTags.AES_256, true);
+
+        // stating the session key came from a password gets the wrong one reported, as the one step
+        // PGPPBEEncryptedData path reports it. A wrong key passes the two byte check by chance with
+        // probability ~2^-15, so a few wrong passphrases are tried rather than relying on a single one.
+        boolean reported = false;
+        for (int i = 0; i != 4 && !reported; i++)
+        {
+            try
+            {
+                openSessionKeyStream(encrypted, ("wrong passphrase " + i).toCharArray(), true);
+            }
+            catch (PGPDataValidationException e)
+            {
+                assertEquals("data check failed.", e.getMessage());
+                reported = true;
+            }
+        }
+        assertTrue("no exception on quick check of wrong password derived session key", reported);
+
+        // the default stays as it was: no early, distinguishable failure to serve as an oracle.
+        for (int i = 0; i != 4; i++)
+        {
+            openSessionKeyStream(encrypted, ("wrong passphrase " + i).toCharArray(), false);
+        }
+
+        // and the right passphrase still decrypts with the check in place.
+        assertArrayEquals(message, SealTestUtil.readLiteral(openSessionKeyStream(encrypted, PASS, true)));
+    }
+
+    private InputStream openSessionKeyStream(byte[] encrypted, char[] passphrase, boolean passwordDerivedSessionKey)
+        throws Exception
+    {
+        PGPEncryptedDataList list = SealTestUtil.readEncryptedDataList(encrypted);
+        PGPSessionKey sessionKey = ((PGPPBEEncryptedData)list.get(0)).getSessionKey(pbeDecryptor(passphrase));
+
+        return list.extractSessionKeyEncryptedData(passwordDerivedSessionKey)
+            .getDataStream(sessionKeyDecryptor(sessionKey));
+    }
+
+    /**
+     * Return the offset in the encoded message of the two encrypted CFB "quick check" bytes. The SEIPD packet
+     * is the last packet, and its encrypted body is the block-size random prefix, the 2 check bytes, the
+     * decrypted content and the 22-byte MDC packet.
+     */
+    private int quickCheckBytesOffset(byte[] encrypted, PGPSessionKey sessionKey)
+        throws Exception
+    {
+        PGPSessionKeyEncryptedData skData = SealTestUtil.readEncryptedDataList(encrypted).extractSessionKeyEncryptedData();
+        int contentLength = Streams.readAll(skData.getDataStream(sessionKeyDecryptor(sessionKey))).length;
+        assertTrue(skData.verify());
+
+        int blockSize = 16; // AES
+        int offset = encrypted.length - (blockSize + 2 + contentLength + 22) + blockSize;
+        assertTrue(offset > 0);
+        return offset;
+    }
+
+    private static PGPSessionKey wrongSessionKey(PGPSessionKey sessionKey, int index)
+    {
+        byte[] key = Arrays.clone(sessionKey.getKey());
+        key[index] ^= 0x01;
+        return new PGPSessionKey(sessionKey.getAlgorithm(), key);
+    }
+
+    private SessionKeyDataDecryptorFactory sessionKeyDecryptor(final PGPSessionKey sessionKey)
+        throws Exception
+    {
         final PBEDataDecryptorFactory delegate = pbeDecryptor(new char[0]);
-        SessionKeyDataDecryptorFactory skFactory = new SessionKeyDataDecryptorFactory()
+        return new SessionKeyDataDecryptorFactory()
         {
             public PGPSessionKey getSessionKey()
             {
@@ -197,9 +377,6 @@ public class SealPBEEncryptedDataTest
                 return delegate.createDataDecryptor(aeadAlgorithm, iv, chunkSize, encAlgorithm, key);
             }
         };
-
-        assertArrayEquals(message, SealTestUtil.readLiteral(skData.getDataStream(skFactory)));
-        assertTrue(skData.verify());
     }
 
     @Test

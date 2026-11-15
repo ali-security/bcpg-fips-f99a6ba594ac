@@ -88,9 +88,13 @@ public class PGPSymmetricKeyEncryptedData
                 throw new EOFException("unexpected end of stream.");
             }
 
-
-            // Note: the oracle attack on "quick check" bytes is not deemed
-            // a security risk for PBE (see PGPPublicKeyEncryptedData)
+            // The check bytes are consumed either way; signalling a mismatch is what makes the CFB quick check
+            // the Mister-Zuccherato oracle, so it is done only where useQuickCheck() allows it. For SEIPD v1 the
+            // MDC is the integrity check.
+            if (!useQuickCheck())
+            {
+                return encStream;
+            }
 
             boolean repeatCheckPassed = iv[iv.length - 2] == (byte)v1
                 && iv[iv.length - 1] == (byte)v2;
@@ -115,5 +119,21 @@ public class PGPSymmetricKeyEncryptedData
         {
             throw new PGPException("Exception creating cipher", e);
         }
+    }
+
+    /**
+     * Whether the legacy CFB "quick check" on the two repeated prefix bytes of a SEIPD v1 (or SED)
+     * packet is applied when this data is decrypted. Reporting a mismatch is what lets a wrong
+     * passphrase be detected - and the stream rewound to try the next SKESK packet - so the
+     * password-based path keeps it, while a session key recovered from a public key operation
+     * suppresses it: there the report is the Mister-Zuccherato oracle on the CFB prefix and the MDC
+     * is the integrity check. Overridden by {@link PGPSessionKeyEncryptedData}, where the caller
+     * states which kind of session key it holds.
+     *
+     * @return true if a quick check mismatch should be reported, false if it should be ignored.
+     */
+    protected boolean useQuickCheck()
+    {
+        return true;
     }
 }

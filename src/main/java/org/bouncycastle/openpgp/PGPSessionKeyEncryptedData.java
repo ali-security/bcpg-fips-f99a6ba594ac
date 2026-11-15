@@ -13,9 +13,18 @@ import org.bouncycastle.openpgp.operator.SessionKeyDataDecryptorFactory;
 public class PGPSessionKeyEncryptedData
     extends PGPSymmetricKeyEncryptedData
 {
+    private final boolean passwordDerivedSessionKey;
+
     PGPSessionKeyEncryptedData(InputStreamPacket encData)
     {
+        this(encData, false);
+    }
+
+    PGPSessionKeyEncryptedData(InputStreamPacket encData, boolean passwordDerivedSessionKey)
+    {
         super(encData);
+
+        this.passwordDerivedSessionKey = passwordDerivedSessionKey;
     }
 
     @Override
@@ -61,5 +70,13 @@ public class PGPSessionKeyEncryptedData
         encStream = createDecryptionStream(dataDecryptorFactory, dataDecryptorFactory.getSessionKey());
 
         return encStream;
+    }
+
+    // Only a session key the caller states came from a password may be quick checked - for one recovered from a
+    // public key operation the check is the Mister-Zuccherato oracle, and integrity is enforced by the SEIPD v1 MDC.
+    @Override
+    protected boolean useQuickCheck()
+    {
+        return passwordDerivedSessionKey;
     }
 }
