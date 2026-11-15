@@ -2,6 +2,7 @@ package org.bouncycastle.openpgp.test;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -53,6 +54,13 @@ import static org.junit.Assert.fail;
  * checked, and the decrypting stream returned a clean EOF - a corrupted final tag went undetected, and
  * an attacker could strip trailing chunks (fixing up the un-authenticated outer packet length) and
  * have the recipient accept the truncated plaintext as authentic.
+ * </p>
+ * <p>
+ * A stream cut short without fixing up the outer packet length must likewise be reported
+ * (CVE-2026-85515): the packet stream signals the missing bytes with an EOFException, which
+ * BCPGInputStream.nextPacketTag() reads as a clean end of message, so it must not escape the AEAD
+ * stream as one - otherwise a truncation landing on a packet boundary skipped the final tag check
+ * and the truncated message was accepted.
  * </p>
  */
 public class SealAEADEncryptedDataTest
@@ -226,6 +234,132 @@ public class SealAEADEncryptedDataTest
                 // final tag check failed
             }
         }
+    }
+
+    @Test
+    public void testTruncatedStreamNotReportedAsCleanEndOfMessage()
+        throws Exception
+    {
+        int[] aeadAlgs = supportedAeadAlgorithms();
+        // reading the literal data a byte at a time never looks past its end, so the read that runs into
+        // the truncation is the next-packet look-ahead; larger reads can run into it from the literal data
+        int[] readSizes = new int[]{ 1, 16, 64, 4096 };
+
+        for (int a = 0; a != aeadAlgs.length; a++)
+        {
+            // two literal data packets, each exactly one chunk long, so the first one ends on a chunk boundary
+            byte[] first = sequentialBytes(CHUNK_LENGTH - 8);
+            byte[] second = SealTestUtil.randomMessage(CHUNK_LENGTH - 8);
+
+            ByteArrayOutputStream plain = new ByteArrayOutputStream();
+            writeLiteral(plain, first);
+            writeLiteral(plain, second);
+            assertEquals(2 * CHUNK_LENGTH, plain.size());
+
+            byte[] message = encryptRaw(aeadAlgs[a], plain.toByteArray());
+
+            for (int r = 0; r != readSizes.length; r++)
+            {
+                int readSize = readSizes[r];
+
+                List literals = drainLiterals(message, readSize);
+                assertEquals(2, literals.size());
+                assertArrayEquals(first, (byte[])literals.get(0));
+                assertArrayEquals(second, (byte[])literals.get(1));
+
+                // cut anywhere inside the AEAD packet body (2 chunks + 2 chunk tags + final tag), leaving the
+                // enclosing packet length claiming the dropped bytes. Dropping up to CHUNK_LENGTH bytes keeps
+                // the first chunk - and so the whole first literal packet - intact, which is what let the
+                // next-packet look-ahead swallow the truncation and end the message cleanly.
+                int bodyLength = 2 * (CHUNK_LENGTH + TAG_LENGTH) + TAG_LENGTH;
+                for (int drop = 1; drop < bodyLength; drop++)
+                {
+                    assertTruncationReported("(" + aeadName(aeadAlgs[a]) + ", drop=" + drop + ", readSize=" + readSize + ")",
+                        truncate(message, drop), readSize);
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testTruncationSignalled()
+        throws Exception
+    {
+        int[] aeadAlgs = supportedAeadAlgorithms();
+        int[] readSizes = new int[]{ 1, 16, 64, 4096 };
+
+        // a packet follows the literal data, as a signature does in a signed message
+        byte[] trailer = new byte[32];
+
+        for (int a = 0; a != aeadAlgs.length; a++)
+        {
+            for (int n = 0; n <= 96; n++)
+            {
+                byte[] content = sequentialBytes(n);
+
+                ByteArrayOutputStream plain = new ByteArrayOutputStream();
+                writeLiteral(plain, content);
+                writeLiteral(plain, trailer);
+
+                byte[] message = encryptRaw(aeadAlgs[a], plain.toByteArray());
+                String desc = describe(aeadAlgs[a], n);
+
+                for (int r = 0; r != readSizes.length; r++)
+                {
+                    int readSize = readSizes[r];
+
+                    // the intact message must still stream cleanly at every read size
+                    List literals = drainLiterals(message, readSize);
+                    assertEquals("round-trip failed " + desc + " readSize=" + readSize, 2, literals.size());
+                    assertArrayEquals("round-trip failed " + desc + " readSize=" + readSize,
+                        content, (byte[])literals.get(0));
+                    assertArrayEquals("round-trip failed " + desc + " readSize=" + readSize,
+                        trailer, (byte[])literals.get(1));
+
+                    // truncate the ciphertext, leaving the enclosing packet length claiming the dropped bytes
+                    for (int drop = 1; drop <= TAG_LENGTH; drop++)
+                    {
+                        assertTruncationReported(desc + " drop=" + drop + " readSize=" + readSize,
+                            truncate(message, drop), readSize);
+                    }
+                }
+            }
+        }
+    }
+
+    private static void assertTruncationReported(String desc, byte[] truncated, int readSize)
+        throws Exception
+    {
+        List literals;
+        try
+        {
+            literals = drainLiterals(truncated, readSize);
+        }
+        catch (EOFException e)
+        {
+            fail("truncation reported as a clean end of stream " + desc + ": " + e.getMessage());
+            return;
+        }
+        catch (IOException e)
+        {
+            // truncation reported while reading the decrypted stream
+            return;
+        }
+        catch (PGPException e)
+        {
+            // truncation early enough to hit the AEAD stream set-up, reported when opening it
+            return;
+        }
+
+        fail("truncated message accepted " + desc + ", " + literals.size() + " literal packet(s) returned");
+    }
+
+    // the message with its last drop octets cut off
+    private static byte[] truncate(byte[] message, int drop)
+    {
+        byte[] truncated = new byte[message.length - drop];
+        System.arraycopy(message, 0, truncated, 0, truncated.length);
+        return truncated;
     }
 
     private static int[] supportedAeadAlgorithms()
@@ -423,6 +557,29 @@ public class SealAEADEncryptedDataTest
         while ((o = factory.nextObject()) != null)
         {
             literals.add(Streams.readAll(((PGPLiteralData)o).getInputStream()));
+        }
+        return literals;
+    }
+
+    // walks the decrypted packet stream to its end, reading each literal in readSize increments
+    private static List drainLiterals(byte[] message, int readSize)
+        throws Exception
+    {
+        JcaPGPObjectFactory factory = new JcaPGPObjectFactory(openDataStream(message));
+
+        List literals = new ArrayList();
+        byte[] buf = new byte[readSize];
+        Object o;
+        while ((o = factory.nextObject()) != null)
+        {
+            InputStream lIn = ((PGPLiteralData)o).getInputStream();
+            ByteArrayOutputStream lOut = new ByteArrayOutputStream();
+            int len;
+            while ((len = lIn.read(buf, 0, readSize)) >= 0)
+            {
+                lOut.write(buf, 0, len);
+            }
+            literals.add(lOut.toByteArray());
         }
         return literals;
     }

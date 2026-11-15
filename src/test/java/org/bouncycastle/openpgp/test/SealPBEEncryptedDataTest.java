@@ -2,6 +2,8 @@ package org.bouncycastle.openpgp.test;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.List;
 
 import org.bouncycastle.bcpg.HashAlgorithmTags;
 import org.bouncycastle.bcpg.SymmetricKeyAlgorithmTags;
@@ -9,9 +11,11 @@ import org.bouncycastle.openpgp.PGPDataValidationException;
 import org.bouncycastle.openpgp.PGPEncryptedData;
 import org.bouncycastle.openpgp.PGPEncryptedDataList;
 import org.bouncycastle.openpgp.PGPException;
+import org.bouncycastle.openpgp.PGPLiteralData;
 import org.bouncycastle.openpgp.PGPPBEEncryptedData;
 import org.bouncycastle.openpgp.PGPSessionKey;
 import org.bouncycastle.openpgp.PGPSessionKeyEncryptedData;
+import org.bouncycastle.openpgp.jcajce.JcaPGPObjectFactory;
 import org.bouncycastle.openpgp.operator.PBEDataDecryptorFactory;
 import org.bouncycastle.openpgp.operator.PGPDataDecryptor;
 import org.bouncycastle.openpgp.operator.PGPKeyEncryptionMethodGenerator;
@@ -158,6 +162,79 @@ public class SealPBEEncryptedDataTest
         {
             // detected while parsing the decrypted stream
         }
+    }
+
+    /**
+     * CVE-2026-85515: a SEIPD v1 message cut short (the enclosing packet length still claiming the dropped
+     * bytes) must not pass as intact. BCPGInputStream.nextPacketTag() reads the resulting EOFException as a
+     * clean end of message, so a truncation landing after a complete packet ends the packet walk early; the
+     * MDC check run by verify() must then report it.
+     */
+    @Test
+    public void testTruncatedIntegrityProtectedMessageRejected()
+        throws Exception
+    {
+        // two literal data packets, so the stream can be cut right after a complete one
+        byte[] first = SealTestUtil.randomMessage(100);
+        byte[] second = SealTestUtil.randomMessage(40);
+
+        JcePBEKeyEncryptionMethodGenerator method = new JcePBEKeyEncryptionMethodGenerator(PASS,
+            SealTestUtil.digestProvider().get(HashAlgorithmTags.SHA256));
+        method.setProvider(SealTestUtil.PROVIDER);
+        byte[] encrypted = SealTestUtil.encryptLiterals(new byte[][] { first, second },
+            SymmetricKeyAlgorithmTags.AES_256, true, new PGPKeyEncryptionMethodGenerator[] { method });
+
+        // the intact message decrypts to both packets and passes the MDC
+        PGPPBEEncryptedData pbeData = (PGPPBEEncryptedData)SealTestUtil.readEncryptedDataList(encrypted).get(0);
+        List literals = readAllLiterals(pbeData.getDataStream(pbeDecryptor(PASS)));
+        assertEquals(2, literals.size());
+        assertArrayEquals(first, (byte[])literals.get(0));
+        assertArrayEquals(second, (byte[])literals.get(1));
+        assertTrue("integrity check must pass", pbeData.verify());
+
+        // drop the MDC packet (22 octets), the second literal packet (19 octet header + 40 octets of data)
+        // and some of the first
+        for (int drop = 1; drop <= 22 + 59 + 16; drop++)
+        {
+            byte[] truncated = new byte[encrypted.length - drop];
+            System.arraycopy(encrypted, 0, truncated, 0, truncated.length);
+
+            assertTrue("truncated SEIPD v1 message accepted (drop=" + drop + ")", truncatedMessageRejected(truncated));
+        }
+    }
+
+    private boolean truncatedMessageRejected(byte[] truncated)
+        throws Exception
+    {
+        try
+        {
+            PGPPBEEncryptedData pbeData = (PGPPBEEncryptedData)SealTestUtil.readEncryptedDataList(truncated).get(0);
+            readAllLiterals(pbeData.getDataStream(pbeDecryptor(PASS)));
+
+            return !pbeData.verify();
+        }
+        catch (IOException e)
+        {
+            return true;
+        }
+        catch (PGPException e)
+        {
+            return true;
+        }
+    }
+
+    private static List readAllLiterals(InputStream clear)
+        throws Exception
+    {
+        JcaPGPObjectFactory factory = new JcaPGPObjectFactory(clear);
+
+        List literals = new ArrayList();
+        Object o;
+        while ((o = factory.nextObject()) != null)
+        {
+            literals.add(Streams.readAll(((PGPLiteralData)o).getInputStream()));
+        }
+        return literals;
     }
 
     @Test

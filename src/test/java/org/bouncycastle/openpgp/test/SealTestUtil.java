@@ -55,6 +55,13 @@ final class SealTestUtil
     static byte[] encrypt(byte[] message, int symAlg, boolean integrity, PGPKeyEncryptionMethodGenerator[] methods)
         throws Exception
     {
+        return encryptLiterals(new byte[][] { message }, symAlg, integrity, methods);
+    }
+
+    // one literal data packet per entry of messages, encrypted together
+    static byte[] encryptLiterals(byte[][] messages, int symAlg, boolean integrity, PGPKeyEncryptionMethodGenerator[] methods)
+        throws Exception
+    {
         ByteArrayOutputStream bOut = new ByteArrayOutputStream();
         PGPEncryptedDataGenerator encGen = new PGPEncryptedDataGenerator(
             new JcePGPDataEncryptorBuilder(symAlg)
@@ -67,10 +74,13 @@ final class SealTestUtil
         }
 
         OutputStream cOut = encGen.open(bOut, new byte[1 << 12]);
-        PGPLiteralDataGenerator litGen = new PGPLiteralDataGenerator();
-        OutputStream lOut = litGen.open(cOut, PGPLiteralData.BINARY, "message.bin", message.length, new Date());
-        lOut.write(message);
-        litGen.close();
+        for (int i = 0; i != messages.length; i++)
+        {
+            PGPLiteralDataGenerator litGen = new PGPLiteralDataGenerator();
+            OutputStream lOut = litGen.open(cOut, PGPLiteralData.BINARY, "message.bin", messages[i].length, new Date());
+            lOut.write(messages[i]);
+            litGen.close();
+        }
         encGen.close();
 
         return bOut.toByteArray();
